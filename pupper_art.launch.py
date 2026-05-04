@@ -80,19 +80,19 @@ def generate_launch_description():
     )
 
     # ── Art-drawing node (starts after forward_command_controller) ─────────
-    pupper_art_node = Node(
-        package="pupper_art",           # adjust to your actual ROS 2 package name
-        executable="pupper_art",
-        output="both",
-    )
+#    pupper_art_node = Node(
+#        package="pupper_art",           # adjust to your actual ROS 2 package name
+#        executable="pupper_art",
+#        output="both",
+#    )
 
     # Delay forward_command_controller until joint_state_broadcaster is up
-    delay_fcc_after_jsb = RegisterEventHandler(
-        event_handler=OnProcessExit(
-            target_action=joint_state_broadcaster_spawner,
-            on_exit=[forward_command_controller_spawner],
-        )
-    )
+#    delay_fcc_after_jsb = RegisterEventHandler(
+#        event_handler=OnProcessExit(
+#            target_action=joint_state_broadcaster_spawner,
+#            on_exit=[forward_command_controller_spawner],
+#        )
+#    )
 
     # Delay art node until forward_command_controller is up
     delay_art_after_fcc = RegisterEventHandler(
@@ -108,7 +108,7 @@ def generate_launch_description():
         joint_state_broadcaster_spawner,
         imu_sensor_broadcaster_spawner,
         delay_fcc_after_jsb,
-        delay_art_after_fcc,
+#        delay_art_after_fcc,
     ]
 
     return LaunchDescription(nodes)
