@@ -25,14 +25,104 @@ Shapes supported: circle, star (5-pointed)
 The node draws the circle first, pauses, then draws the star.
 """
 
+import sys
+import threading
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 import numpy as np
 import scipy.optimize
+import matplotlib
+import importlib
+import os
+
+# ──────────────────────────────────────────────
+# Matplotlib backend selection
+# ──────────────────────────────────────────────
+# On a Raspberry Pi:
+#   TkAgg  — best choice; needs:  sudo apt install python3-tk
+#   Qt5Agg — needs X11/Wayland ($DISPLAY).  Over plain SSH it crashes
+#             unless QT_QPA_PLATFORM=eglfs (direct HDMI framebuffer).
+#   Agg    — non-interactive fallback; saves plots to file only.
+#
+# IMPORTANT: do NOT import matplotlib.pyplot inside _try_backend.
+# Importing pyplot locks the GUI framework ("headless" if no display has
+# been initialised yet).  If Qt5Agg is locked in as headless during the
+# probe it will crash with "Cannot load backend Qt5Agg … headless is
+# currently running" when the main thread later calls plt.subplots().
+# We only call matplotlib.use() here; pyplot is imported once below,
+# after the backend is chosen, on the main thread.
+
+def _try_backend(name):
+    """Check if a backend module exists and call matplotlib.use(). No pyplot."""
+    try:
+        importlib.import_module(f"matplotlib.backends.backend_{name.lower()}")
+        matplotlib.use(name)
+        print(f"[INFO] Matplotlib backend selected: {name}", flush=True)
+        return True
+    except ImportError as e:
+        print(f"[DEBUG] Backend {name} unavailable: {e}", flush=True)
+        return False
+    except Exception as e:
+        print(f"[DEBUG] Backend {name} error: {e}", flush=True)
+        return False
+
+def _select_backend():
+    forced = os.environ.get("MPLBACKEND", "")
+    if forced:
+        matplotlib.use(forced)
+        print(f"[INFO] MPLBACKEND override: {forced}", flush=True)
+        return forced
+    # 1. TkAgg — works on Pi with HDMI; no display server needed.
+    #    Install with:  sudo apt install python3-tk
+    if _try_backend("TkAgg"):
+        return "TkAgg"
+    # 2. Qt5Agg — if no display server, try eglfs (direct framebuffer).
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "eglfs")
+        print("[INFO] No $DISPLAY — setting QT_QPA_PLATFORM=eglfs", flush=True)
+    if _try_backend("Qt5Agg"):
+        return "Qt5Agg"
+    # 3. Non-interactive fallback.
+    matplotlib.use("Agg")
+    print(
+        "[WARNING] No interactive matplotlib backend available.\n"
+        "  The drawing window will not appear.\n"
+        "  Fix:  sudo apt install python3-tk   (then restart)", flush=True
+    )
+    return "Agg"
+
+_active_backend = _select_backend()
+
+# Import pyplot ONCE here on the main thread, after the backend is chosen.
+# Never import it inside threads or inside _try_backend — doing so locks the
+# GUI framework to "headless" and causes Qt5Agg to crash later.
+import matplotlib.pyplot as plt
 
 np.set_printoptions(precision=4, suppress=True)
+
+# ══════════════════════════════════════════════
+# Global shape / drawing parameters
+# Edit these to change circle and star geometry.
+# ══════════════════════════════════════════════
+
+# Circle
+CIRCLE_RADIUS      = 0.01   # m — radius of drawn circle
+CIRCLE_N_POINTS    = 150    # waypoints per loop
+CIRCLE_LOOP_FACTOR = 1.5    # number of loops
+
+# Star (5-pointed)
+STAR_R_OUTER       = 0.03   # m — tip-to-centre radius
+STAR_R_INNER       = 0.01   # m — valley-to-centre radius
+STAR_N_POINTS      = 5      # number of star tips
+STAR_N_TOTAL       = 120    # total interpolated waypoints per loop
+STAR_LOOP_FACTOR   = 1.5    # number of loops
+
+# Custom-path drawing window
+CUSTOM_WORKSPACE_RADIUS = max(STAR_R_OUTER * 1.5, 0.04)  # m — boundary circle
+CUSTOM_N_INTERP    = 200    # waypoints to interpolate drawn path to
+
 
 # ──────────────────────────────────────────────
 # Homogeneous transform helpers
@@ -58,9 +148,12 @@ def translation(x, y, z):
 # Shape generators
 # ──────────────────────────────────────────────
 
-def generate_circle(center_x, center_y, z_floor, radius=0.04, n_points=120):
-    """Generate (x, y, z) waypoints for a circle in the floor plane."""
-    angles = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
+def generate_circle(center_x, center_y, z_floor, radius=None, n_points=None, loop_factor=None):
+    """Generate (x, y, z) waypoints for a circle in the floor plane, with loop_factor loops."""
+    if radius      is None: radius      = CIRCLE_RADIUS
+    if n_points    is None: n_points    = CIRCLE_N_POINTS
+    if loop_factor is None: loop_factor = CIRCLE_LOOP_FACTOR
+    angles = np.linspace(0, loop_factor * 2 * np.pi, int(loop_factor * n_points), endpoint=False)
     pts = []
     for a in angles:
         pts.append(np.array([
@@ -68,22 +161,185 @@ def generate_circle(center_x, center_y, z_floor, radius=0.04, n_points=120):
             center_y + radius * np.sin(a),
             z_floor
         ]))
-    pts.append(pts[0])          # close the shape
     return pts
 
 
-def generate_star(center_x, center_y, z_floor, r_outer=0.045, r_inner=0.018, n_points=5):
-    """Generate (x, y, z) waypoints for a 5-pointed star in the floor plane."""
-    pts = []
-    for i in range(2 * n_points + 1):
+def generate_star(cx, cy, z, r_outer=None, r_inner=None, n_points=None, n_total=None, loop_factor=None):
+    """
+    Generate a dense star path by interpolating along each edge between
+    alternating outer (tip) and inner (valley) vertices.
+    n_total: approximate total number of points (distributed evenly across edges).
+    loop_factor: number of times to loop through the star.
+    """
+    if r_outer     is None: r_outer     = STAR_R_OUTER
+    if r_inner     is None: r_inner     = STAR_R_INNER
+    if n_points    is None: n_points    = STAR_N_POINTS
+    if n_total     is None: n_total     = STAR_N_TOTAL
+    if loop_factor is None: loop_factor = STAR_LOOP_FACTOR
+    # Build the sparse corner vertices (outer tip, inner valley, ...)
+    corners = []
+    for i in range(2 * n_points):
         r = r_outer if (i % 2 == 0) else r_inner
-        angle = np.pi / 2 + i * np.pi / n_points   # start at top
-        pts.append(np.array([
-            center_x + r * np.cos(angle),
-            center_y + r * np.sin(angle),
-            z_floor
-        ]))
+        a = np.pi / 2 + i * np.pi / n_points
+        corners.append(np.array([cx + r * np.cos(a), cy + r * np.sin(a), z]))
+ 
+    n_edges = len(corners)  # = 2 * n_points = 10
+    pts_per_edge = max(2, n_total // n_edges)
+ 
+    pts = []
+    for loop in range(int(loop_factor) + 1):  # for 1.5, do 1 full + half
+        for i in range(n_edges):
+            if loop == int(loop_factor) and i >= n_edges // 2:  # for half loop, stop at half
+                break
+            start = corners[i]
+            end   = corners[(i + 1) % n_edges]
+            # linspace from start→end, endpoint=False avoids duplicating the corner
+            for t in np.linspace(0, 1, pts_per_edge, endpoint=False):
+                pts.append(start + t * (end - start))
     return pts
+
+
+# ──────────────────────────────────────────────
+# Custom path drawing window
+# ──────────────────────────────────────────────
+
+def capture_custom_path(center_x, center_y, z_floor,
+                        workspace_radius=0.05, n_interp=200):
+    """
+    Opens an interactive matplotlib window for drawing a custom path.
+
+    The canvas is centred on (center_x, center_y) and the grey circle shows
+    the approximate reachable workspace of the RF leg.
+
+    Controls:
+      Left-click  — add a waypoint
+      Right-click — finish and confirm the path
+      Middle-click / 'u' key — undo the last point
+      Close window without right-clicking — cancels (returns None)
+
+    Returns a list of np.array([x, y, z]) waypoints interpolated to n_interp
+    points, or None if cancelled.
+    """
+    # Shared state between callbacks
+    state = {'points': [], 'confirmed': False, 'cancelled': False}
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    fig.canvas.manager.set_window_title('Lyra — Draw Custom Path')
+
+    # Workspace boundary
+    boundary = plt.Circle((center_x, center_y), workspace_radius,
+                           color='#cccccc', fill=False, linestyle='--', linewidth=1.5)
+    ax.add_patch(boundary)
+    ax.plot(center_x, center_y, '+', color='#999999', markersize=12)
+
+    ax.set_xlim(center_x - workspace_radius * 1.3, center_x + workspace_radius * 1.3)
+    ax.set_ylim(center_y - workspace_radius * 1.3, center_y + workspace_radius * 1.3)
+    ax.set_aspect('equal')
+    ax.set_xlabel('X (m, robot body frame)')
+    ax.set_ylabel('Y (m, robot body frame)')
+    ax.set_title(
+        'Left-click: add point   Right-click: confirm   U: undo\n'
+        'Draw a single connected path — no gaps or jumps.',
+        fontsize=9
+    )
+
+    # Live plot objects
+    path_line, = ax.plot([], [], 'b-o', linewidth=2, markersize=5, zorder=3)
+    start_dot, = ax.plot([], [], 'go', markersize=10, zorder=4, label='start')
+    end_dot,   = ax.plot([], [], 'rs', markersize=10, zorder=4, label='end')
+    status_text = ax.text(
+        0.01, 0.01, 'No points yet.',
+        transform=ax.transAxes, fontsize=8, color='#444444',
+        verticalalignment='bottom'
+    )
+
+    def _redraw():
+        pts = state['points']
+        if len(pts) == 0:
+            path_line.set_data([], [])
+            start_dot.set_data([], [])
+            end_dot.set_data([], [])
+            status_text.set_text('No points yet.')
+        else:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            path_line.set_data(xs, ys)
+            start_dot.set_data([xs[0]], [ys[0]])
+            end_dot.set_data([xs[-1]], [ys[-1]])
+            status_text.set_text(f'{len(pts)} point(s).  Right-click to confirm.')
+        fig.canvas.draw_idle()
+
+    def _on_click(event):
+        if event.inaxes != ax:
+            return
+        if event.button == 1:   # left-click: add point
+            x, y = event.xdata, event.ydata
+            # Clamp to workspace circle
+            dx, dy = x - center_x, y - center_y
+            dist = np.hypot(dx, dy)
+            if dist > workspace_radius:
+                scale = workspace_radius / dist
+                x = center_x + dx * scale
+                y = center_y + dy * scale
+            state['points'].append((x, y))
+            _redraw()
+        elif event.button == 3:  # right-click: confirm
+            if len(state['points']) >= 2:
+                state['confirmed'] = True
+                plt.close(fig)
+            else:
+                status_text.set_text('Need at least 2 points!')
+                fig.canvas.draw_idle()
+        elif event.button == 2:  # middle-click: undo
+            if state['points']:
+                state['points'].pop()
+                _redraw()
+
+    def _on_key(event):
+        if event.key in ('u', 'U', 'backspace'):
+            if state['points']:
+                state['points'].pop()
+                _redraw()
+
+    def _on_close(event):
+        if not state['confirmed']:
+            state['cancelled'] = True
+
+    fig.canvas.mpl_connect('button_press_event', _on_click)
+    fig.canvas.mpl_connect('key_press_event', _on_key)
+    fig.canvas.mpl_connect('close_event', _on_close)
+
+    plt.tight_layout()
+    plt.show(block=True)   # blocks until the window is closed
+
+    if state['cancelled'] or not state['confirmed'] or len(state['points']) < 2:
+        print('[custom path] Cancelled or too few points — aborting.', flush=True)
+        return None
+
+    # ── Interpolate the clicked points to n_interp evenly-spaced waypoints ──
+    raw = np.array(state['points'])   # shape (N, 2)
+
+    # Compute cumulative arc length along the raw path
+    diffs = np.diff(raw, axis=0)
+    seg_lengths = np.hypot(diffs[:, 0], diffs[:, 1])
+    cum_len = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    total_len = cum_len[-1]
+
+    if total_len < 1e-6:
+        print('[custom path] Path is too short — aborting.', flush=True)
+        return None
+
+    # Uniform re-parameterisation
+    t_uniform = np.linspace(0, total_len, n_interp)
+    x_interp = np.interp(t_uniform, cum_len, raw[:, 0])
+    y_interp = np.interp(t_uniform, cum_len, raw[:, 1])
+
+    waypoints = [np.array([x_interp[i], y_interp[i], z_floor])
+                 for i in range(n_interp)]
+
+    print(f'[custom path] {len(waypoints)} waypoints generated '
+          f'(total path length ≈ {total_len*100:.1f} cm).', flush=True)
+    return waypoints
 
 
 # ──────────────────────────────────────────────
@@ -102,26 +358,15 @@ class CascadedPID:
     """
 
     def __init__(self,
-                 # position PID (Increase this so it chases the shape harder)
-                 kp_pos=3.0,  ki_pos=0.0, kd_pos=0.01,  # Bumped kp to 3.0, added a tiny kd
-                 # velocity PID 
-                 kp_vel=1.0,  ki_vel=0.0, kd_vel=0.0,   # Bumped kp to 1.0
-                 # torque PID (Increase this to give the motors more authority)
-                 kp_trq=0.2, ki_trq=0.0, kd_trq=0.0,    # Bumped kp to 0.2
-                 dt=0.005,
-                 max_vel=4.0, max_trq=2.0, max_delta=0.1): # Increased max_delta to 0.1 so it's allowed to move further!
+                 kp_pos=1,  ki_pos=0.001, kd_pos=0.001,
+                 kp_vel=1,  ki_vel=0.001, kd_vel=0.001,
+                 kp_trq=0.0001,  ki_trq=0.00001, kd_trq=0.000001,
+                 dt=0.005, max_vel=2.0, max_trq=1.0, max_delta=0.05):
         self.dt = dt
-
-        # gains
         self.kp_pos, self.ki_pos, self.kd_pos = kp_pos, ki_pos, kd_pos
         self.kp_vel, self.ki_vel, self.kd_vel = kp_vel, ki_vel, kd_vel
         self.kp_trq, self.ki_trq, self.kd_trq = kp_trq, ki_trq, kd_trq
-
-        # limits
-        self.max_vel   = max_vel
-        self.max_trq   = max_trq
-        self.max_delta = max_delta          # max output position delta per step
-
+        self.max_vel, self.max_trq, self.max_delta = max_vel, max_trq, max_delta
         self.reset()
 
     def reset(self):
@@ -182,12 +427,26 @@ class CascadedPID:
 
 class PupperArt(Node):
 
-    # ── Standing angles for stationary legs (LF, RB, LB) ─────────────────
-    # These keep the body level while the RF leg draws.
-    # Obtained by running IK for each leg at its nominal stand position.
-    STAND_ANGLES_LF = np.array([ 0.00,  -0.65, 1.30])
-    STAND_ANGLES_RB = np.array([ 0.00,  -0.65, 1.30])
-    STAND_ANGLES_LB = np.array([ 0.00,  0.65, -1.30])
+    # ── Standing angles for all four legs ─────────────────────────────────
+
+
+    STAND_ANGLES_LF = np.array([-1.72766, -0.44671, +2.51156])
+    STAND_ANGLES_RB = np.array([+1.66891, +1.72504, -2.31167])
+    STAND_ANGLES_LB = np.array([-1.60368, -1.68193, +2.64584])
+
+    #STAND_ANGLES_LF = np.array([-1.84630, -0.45434, +2.65576])
+    #STAND_ANGLES_RB = np.array([+1.62009, +1.65790, -2.35630])
+    #STAND_ANGLES_LB = np.array([-0.31697, -0.01030, +0.42069])
+
+
+    # RF home:
+    STAND_ANGLES_RF_HOME = np.array([+1.04291, -0.39978, +0.69436])
+
+
+    # Servo stiffness — ramped from 0 → these values during stand_up phase
+    SERVO_KP      = 5.0   # position gain — enough to stand, not so much it snaps
+    SERVO_KD      = 0.2   # damping gain
+    RAMP_UP_SECS  = 3.0   # seconds to ramp from limp to full stiffness
 
     # RF pen tip height while drawing (metres, in body frame, negative = down)
     PEN_Z = -0.14
@@ -199,11 +458,7 @@ class PupperArt(Node):
     RF_CENTER_X =  0.06
     RF_CENTER_Y = -0.09
 
-    # Drawing parameters
-    CIRCLE_RADIUS   = 0.035   # m
-    STAR_R_OUTER    = 0.040   # m
-    STAR_R_INNER    = 0.016   # m
-    N_CIRCLE_PTS    = 150
+    # Drawing frequency parameters
     DRAW_FREQ       = 50.0    # Hz  (waypoint advance rate)
     CTRL_FREQ       = 200.0   # Hz  (PD / publish rate)
 
@@ -215,6 +470,10 @@ class PupperArt(Node):
             JointState, 'joint_states', self._joint_cb, 10)
         self.cmd_pub = self.create_publisher(
             Float64MultiArray, '/forward_command_controller/commands', 10)
+        self.kp_pub  = self.create_publisher(
+            Float64MultiArray, '/forward_kp_controller/commands', 10)
+        self.kd_pub  = self.create_publisher(
+            Float64MultiArray, '/forward_kd_controller/commands', 10)
 
         # ── State ──────────────────────────────────────────────────────────
         self.joint_positions  = None
@@ -223,38 +482,115 @@ class PupperArt(Node):
         # 12-element command array: [RF(3), LF(3), RB(3), LB(3)]
         self.cmd = np.zeros(12)
 
-        # IK-computed target for RF leg
-        self.target_rf = np.array(self.STAND_ANGLES_LF)  # init to stand
+        # IK-computed target for RF leg — use RF home, not LF angles
+        self.target_rf = np.array(self.STAND_ANGLES_RF_HOME)
 
         # Cascaded PIDs — one per RF joint
         dt_pid = 1.0 / self.CTRL_FREQ
         self.pids = [CascadedPID(dt=dt_pid) for _ in range(3)]
 
         # ── Drawing sequence ───────────────────────────────────────────────
-        cx, cy = self.RF_CENTER_X, self.RF_CENTER_Y
-        self.shapes = [
-            generate_circle(cx, cy, self.PEN_Z,
-                            radius=self.CIRCLE_RADIUS,
-                            n_points=self.N_CIRCLE_PTS),
-            generate_star(cx, cy, self.PEN_Z,
-                          r_outer=self.STAR_R_OUTER,
-                          r_inner=self.STAR_R_INNER),
-        ]
-        self.shape_names = ['circle', 'star']
+        self.current_shape = None
+        self.shape_name = None
+        self.current_wp_idx = 0
+        self.desired_positions = []
+        self.actual_positions = []
 
-        self.current_shape_idx = 0
-        self.current_wp_idx    = 0
-        self.phase             = 'stand'   # stand → pen_down → draw → pen_up → done
+        # stand_up: ramp all 4 legs to standing with increasing kp/kd
+        # stand:    hold for 2 s, confirm stability
+        # pen_down → draw → pen_up → done → standing_hold (until q)
+        self.phase             = 'idle'   # waits for 's' keypress
         self.phase_counter     = 0
-        self.STAND_TICKS       = int(2.0 * self.CTRL_FREQ)   # 2 s stand-still
-        self.PEN_DOWN_TICKS    = int(1.0 * self.CTRL_FREQ)   # 1 s lower pen
+        self.RAMP_TICKS        = int(self.RAMP_UP_SECS * self.CTRL_FREQ)
+        self.STAND_TICKS       = int(2.0 * self.CTRL_FREQ)
+        self.PEN_DOWN_TICKS    = int(1.0 * self.CTRL_FREQ)
+        self.TRANSITION_TICKS  = int(1.0 * self.CTRL_FREQ)  # make transitions slow and smooth
 
-        self.draw_wp_counter   = 0         # counts ctrl ticks per waypoint hold
+        self.draw_wp_counter   = 0
+
+        # ── Custom-path drawing request (set by key thread, handled on main) ─
+        self._custom_path_request = threading.Event()
 
         # ── Timers ─────────────────────────────────────────────────────────
         self.ctrl_timer = self.create_timer(1.0 / self.CTRL_FREQ, self._ctrl_cb)
 
-        self.get_logger().info('PupperArt node started — waiting for joint states …')
+        # ── Keypress thread ────────────────────────────────────────────────
+        self._key_thread = threading.Thread(target=self._key_loop, daemon=True)
+        self._key_thread.start()
+
+        self.get_logger().info(
+            'PupperArt ready.\n'
+            '  s = stand up\n'
+            '  c = draw circle\n'
+            '  p = draw star\n'
+            '  d = draw custom path (opens interactive window)\n'
+            '  q = relax and quit\n'
+        )
+
+    def _start_drawing(self, shape_name, custom_waypoints=None):
+        cx, cy = self.RF_CENTER_X, self.RF_CENTER_Y
+        if shape_name == 'circle':
+            self.current_shape = generate_circle(cx, cy, self.PEN_Z)
+        elif shape_name == 'star':
+            self.current_shape = generate_star(cx, cy, self.PEN_Z)
+        elif shape_name == 'custom':
+            if custom_waypoints is None or len(custom_waypoints) < 2:
+                print('[custom] No valid waypoints — aborting.', flush=True)
+                return
+            self.current_shape = custom_waypoints
+        self.shape_name = shape_name
+        self.current_wp_idx = 0
+        self.desired_positions = []
+        self.actual_positions = []
+        self.phase = 'move_to_start'
+        self.phase_counter = 0
+        print(f'[DRAWING {shape_name.upper()}]', flush=True)
+
+    def _key_loop(self):
+        print('\nControls:  s = stand   c = circle   p = star   d = draw custom   q = relax + quit\n', flush=True)
+        while rclpy.ok():
+            key = input().strip().lower()
+            if key == 's':
+                if self.phase == 'idle':
+                    self.phase = 'stand_up'
+                    self.phase_counter = 0
+                    print('[STANDING UP]', flush=True)
+                else:
+                    print('[already standing or drawing]', flush=True)
+            elif key == 'c':
+                if self.phase in ['standing_hold', 'done']:
+                    self._start_drawing('circle')
+                elif self.phase == 'idle':
+                    print('[press s to stand first]', flush=True)
+                else:
+                    print(f'[not ready — phase: {self.phase}]', flush=True)
+            elif key == 'p':
+                if self.phase in ['standing_hold', 'done']:
+                    self._start_drawing('star')
+                elif self.phase == 'idle':
+                    print('[press s to stand first]', flush=True)
+                else:
+                    print(f'[not ready — phase: {self.phase}]', flush=True)
+            elif key == 'd':
+                if self.phase in ['standing_hold', 'done']:
+                    print(
+                        '[CUSTOM PATH] Opening drawing window…\n'
+                        '  Left-click to add points, right-click to confirm, U to undo.\n'
+                        '  Draw a single connected path — no gaps or jumps.\n'
+                        '  The dashed circle shows the RF leg workspace boundary.',
+                        flush=True
+                    )
+                    # Signal the main thread to open the window.
+                    # plt.show(block=True) must run on the main thread — calling
+                    # it from here causes it to return immediately on Qt/Tk backends.
+                    self._custom_path_request.set()
+                elif self.phase == 'idle':
+                    print('[press s to stand first]', flush=True)
+                else:
+                    print(f'[not ready — phase: {self.phase}]', flush=True)
+            elif key == 'q':
+                print('[RELAXING AND QUITTING]', flush=True)
+                self.phase = 'relax_quit'
 
     # ──────────────────────────────────────────────────────────────────────
     # Forward kinematics (RF leg only)
@@ -312,28 +648,49 @@ class PupperArt(Node):
     # ──────────────────────────────────────────────────────────────────────
 
     def _current_waypoint(self):
-        shape = self.shapes[self.current_shape_idx]
-        return shape[self.current_wp_idx]
+        return self.current_shape[self.current_wp_idx]
 
     def _advance_waypoint(self):
-        shape = self.shapes[self.current_shape_idx]
         self.current_wp_idx += 1
-        if self.current_wp_idx >= len(shape):
+        if self.current_wp_idx >= len(self.current_shape):
             # Finished this shape
-            self.get_logger().info(
-                f'Finished drawing {self.shape_names[self.current_shape_idx]}!')
-            self.current_shape_idx += 1
-            self.current_wp_idx = 0
-            if self.current_shape_idx >= len(self.shapes):
-                self.phase = 'done'
-            else:
-                self.phase = 'pen_up'
-                self.phase_counter = 0
-                self.get_logger().info(
-                    f'Starting {self.shape_names[self.current_shape_idx]}…')
+            self.get_logger().info(f'Finished drawing {self.shape_name}!')
+            self.phase = 'pen_up'
+            self.phase_counter = 0
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Control callback (200 Hz)
+    def _plot_trajectory(self):
+        if not self.desired_positions or not self.actual_positions:
+            return
+        desired = np.array(self.desired_positions)
+        actual = np.array(self.actual_positions)
+        
+        # RMSE
+        rmse = np.sqrt(np.mean((desired - actual)**2, axis=0))
+        print(f'RMSE for {self.shape_name}: X={rmse[0]:.4f}, Y={rmse[1]:.4f}, Z={rmse[2]:.4f}')
+        
+        # Plot desired vs actual
+        plt.figure(figsize=(10, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(desired[:, 0], desired[:, 1], 'b-', label='Desired', linewidth=2)
+        plt.plot(actual[:, 0], actual[:, 1], 'r--', label='Actual', linewidth=1)
+        plt.title(f'{self.shape_name.capitalize()} Trajectory')
+        plt.xlabel('X')
+        plt.ylabel('Y')
+        plt.legend()
+        plt.axis('equal')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(desired[:, 2], 'b-', label='Desired Z')
+        plt.plot(actual[:, 2], 'r--', label='Actual Z')
+        plt.title(f'{self.shape_name.capitalize()} Z Position')
+        plt.xlabel('Time step')
+        plt.ylabel('Z')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.shape_name}_trajectory.png')
+        # plt.show()  # Removed to avoid blocking
     # ──────────────────────────────────────────────────────────────────────
 
     def _ctrl_cb(self):
@@ -349,58 +706,146 @@ class PupperArt(Node):
         # ── State machine ──────────────────────────────────────────────────
         CTRL_PER_WP = max(1, int(self.CTRL_FREQ / self.DRAW_FREQ))
 
-        if self.phase == 'stand':
-            # Hold standing pose for STAND_TICKS
-            target_rf_ee = np.array([self.RF_CENTER_X,
-                                     self.RF_CENTER_Y,
-                                     self.PEN_UP_Z])
-            self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
+        if self.phase == 'idle':
+            return   # waiting for 's'
+
+        elif self.phase == 'stand_up':
+            # Ramp kp/kd linearly from 0 → SERVO_KP/KD over RAMP_TICKS.
+            # All 4 legs are commanded to their standing targets the whole time,
+            # so as stiffness increases they pull themselves to the right pose.
+            alpha  = min(1.0, self.phase_counter / self.RAMP_TICKS)
+            kp_now = alpha * self.SERVO_KP
+            kd_now = alpha * self.SERVO_KD
+            self.kp_pub.publish(Float64MultiArray(data=[kp_now] * 12))
+            self.kd_pub.publish(Float64MultiArray(data=[kd_now] * 12))
+
+            stand_cmd = np.concatenate([
+                self.STAND_ANGLES_RF_HOME,
+                self.STAND_ANGLES_LF,
+                self.STAND_ANGLES_RB,
+                self.STAND_ANGLES_LB,
+            ])
+            self.cmd_pub.publish(Float64MultiArray(data=stand_cmd.tolist()))
+
+            self.phase_counter += 1
+            if self.phase_counter >= self.RAMP_TICKS:
+                self.phase = 'stand'
+                self.phase_counter = 0
+                self.get_logger().info('All legs standing — holding 2 s before drawing…')
+            return   # skip PID / publish below during ramp
+
+        elif self.phase == 'stand':
+            # Hold all four legs at standing targets for STAND_TICKS.
+            # kp/kd are already at full value from stand_up phase.
+            self.target_rf = np.array(self.STAND_ANGLES_RF_HOME)
+            stand_cmd = np.concatenate([
+                self.STAND_ANGLES_RF_HOME,
+                self.STAND_ANGLES_LF,
+                self.STAND_ANGLES_RB,
+                self.STAND_ANGLES_LB,
+            ])
+            self.cmd_pub.publish(Float64MultiArray(data=stand_cmd.tolist()))
             self.phase_counter += 1
             if self.phase_counter >= self.STAND_TICKS:
+                self.phase = 'standing_hold'
+                self.phase_counter = 0
+                self.get_logger().info('Standing stable — press c for circle, p for star, or d for custom.')
+            return   # skip PID / publish below during hold
+
+        elif self.phase == 'standing_hold':
+            # Hold standing pose indefinitely; waiting for 'c', 'p' or 'q'
+            stand_cmd = np.concatenate([
+                self.STAND_ANGLES_RF_HOME,
+                self.STAND_ANGLES_LF,
+                self.STAND_ANGLES_RB,
+                self.STAND_ANGLES_LB,
+            ])
+            self.cmd_pub.publish(Float64MultiArray(data=stand_cmd.tolist()))
+            return
+
+        elif self.phase == 'move_to_start':
+            # Smoothly move the pen to the shape start position at pen-up height
+            first_wp = self._current_waypoint()
+            start_target = np.array([first_wp[0], first_wp[1], self.PEN_UP_Z])
+            current_ee = self._rf_fk(rf_pos)
+            alpha = min(1.0, self.phase_counter / self.TRANSITION_TICKS)
+            target_rf_ee = current_ee + alpha * (start_target - current_ee)
+            self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
+            self.phase_counter += 1
+            if self.phase_counter >= self.TRANSITION_TICKS:
                 self.phase = 'pen_down'
                 self.phase_counter = 0
-                self.get_logger().info('Standing stable — lowering pen…')
+                self.get_logger().info('Lowering pen to start drawing…')
 
         elif self.phase == 'pen_down':
-            # Smoothly lower pen to drawing height
+            # Smoothly lower pen from pen-up height to drawing height while holding XY at start
+            first_wp = self._current_waypoint()
             alpha = min(1.0, self.phase_counter / self.PEN_DOWN_TICKS)
             target_z = self.PEN_UP_Z + alpha * (self.PEN_Z - self.PEN_UP_Z)
-            wp = self._current_waypoint()
-            target_rf_ee = np.array([wp[0], wp[1], target_z])
+            target_rf_ee = np.array([first_wp[0], first_wp[1], target_z])
             self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
             self.phase_counter += 1
             if self.phase_counter >= self.PEN_DOWN_TICKS:
                 self.phase = 'draw'
                 self.draw_wp_counter = 0
                 self.get_logger().info(
-                    f'Drawing {self.shape_names[self.current_shape_idx]}…')
+                    f'Drawing {self.shape_name}…')
 
         elif self.phase == 'draw':
             wp = self._current_waypoint()
             self.target_rf = self._rf_ik(wp, initial_guess=list(rf_pos))
+            self.desired_positions.append(wp)
+            self.actual_positions.append(self._rf_fk(rf_pos))
             self.draw_wp_counter += 1
             if self.draw_wp_counter >= CTRL_PER_WP:
                 self.draw_wp_counter = 0
                 self._advance_waypoint()
 
         elif self.phase == 'pen_up':
-            # Lift pen, then go to start of next shape
-            alpha = min(1.0, self.phase_counter / self.PEN_DOWN_TICKS)
-            target_z = self.PEN_Z + alpha * (self.PEN_UP_Z - self.PEN_Z)
-            next_wp = self._current_waypoint()
-            target_rf_ee = np.array([next_wp[0], next_wp[1], target_z])
+            # Smoothly lift the pen vertically at the final drawing XY position
+            current_ee = self._rf_fk(rf_pos)
+            target_lift = np.array([current_ee[0], current_ee[1], self.PEN_UP_Z])
+            alpha = min(1.0, self.phase_counter / self.TRANSITION_TICKS)
+            target_rf_ee = current_ee + alpha * (target_lift - current_ee)
             self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
             self.phase_counter += 1
-            if self.phase_counter >= self.PEN_DOWN_TICKS:
-                self.phase = 'pen_down'
+            if self.phase_counter >= self.TRANSITION_TICKS:
+                self.phase = 'return_home'
                 self.phase_counter = 0
+                self.get_logger().info('Pen lifted — returning smoothly to home position…')
+
+        elif self.phase == 'return_home':
+            # Smoothly move the pen home at the raised pen-up height
+            current_ee = self._rf_fk(rf_pos)
+            target_center = np.array([self.RF_CENTER_X, self.RF_CENTER_Y, self.PEN_UP_Z])
+            alpha = min(1.0, self.phase_counter / self.TRANSITION_TICKS)
+            target_rf_ee = current_ee + alpha * (target_center - current_ee)
+            self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
+            self.phase_counter += 1
+            if self.phase_counter >= self.TRANSITION_TICKS:
+                self.phase = 'standing_hold'
+                self.phase_counter = 0
+                self._plot_trajectory()
+                self.get_logger().info('Ready for next command — press c for circle, p for star, or d for custom.')
 
         elif self.phase == 'done':
-            # Raise pen, return to stand centre
+            # Raise pen back to home, hold briefly, then return to standing_hold
             target_rf_ee = np.array([self.RF_CENTER_X,
                                      self.RF_CENTER_Y,
                                      self.PEN_UP_Z])
             self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
+            self.phase_counter += 1
+            if self.phase_counter >= int(1.0 * self.CTRL_FREQ):
+                self.get_logger().info('Drawing complete — standing by. Press q to quit.')
+                self.phase = 'standing_hold'
+                self.phase_counter = 0
+
+        elif self.phase == 'relax_quit':
+            zero = Float64MultiArray(data=[0.0] * 12)
+            self.cmd_pub.publish(zero)
+            self.kp_pub.publish(zero)
+            self.kd_pub.publish(zero)
+            sys.exit(0)
 
         # ── Cascaded PID correction on RF joints ──────────────────────────
         rf_cmd = np.zeros(3)
@@ -425,10 +870,9 @@ class PupperArt(Node):
 
         # ── Logging (throttled) ───────────────────────────────────────────
         if self.phase == 'draw':
-            shape_name  = self.shape_names[self.current_shape_idx]
-            n_wps       = len(self.shapes[self.current_shape_idx])
+            n_wps = len(self.current_shape)
             self.get_logger().info(
-                f'[{shape_name}] wp {self.current_wp_idx}/{n_wps} | '
+                f'[{self.shape_name}] wp {self.current_wp_idx}/{n_wps} | '
                 f'RF target: {self.target_rf} | '
                 f'RF actual: {rf_pos} | '
                 f'EE target: {self._rf_fk(self.target_rf)} | '
@@ -444,14 +888,37 @@ class PupperArt(Node):
 def main():
     rclpy.init()
     node = PupperArt()
+
+    if matplotlib.get_backend() == 'Agg':
+        print(
+            '[WARNING] Non-interactive backend — drawing window will not appear.\n'
+            '  Fix:  sudo apt install python3-tk   (then restart)', flush=True
+        )
+
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info('Interrupted — sending zero command…')
+        # Non-blocking spin so we can service matplotlib on the main thread.
+        # plt.show(block=True) must be called from the main thread or it returns
+        # immediately on Qt/Tk backends before the user can draw anything.
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(node)
+        while rclpy.ok():
+            executor.spin_once(timeout_sec=0.05)
+            if node._custom_path_request.is_set():
+                node._custom_path_request.clear()
+                waypoints = capture_custom_path(
+                    center_x=node.RF_CENTER_X,
+                    center_y=node.RF_CENTER_Y,
+                    z_floor=node.PEN_Z,
+                    workspace_radius=CUSTOM_WORKSPACE_RADIUS,
+                    n_interp=CUSTOM_N_INTERP,
+                )
+                if waypoints is not None:
+                    node._start_drawing('custom', custom_waypoints=waypoints)
+                else:
+                    print('[custom path cancelled — still in standing_hold]', flush=True)
+    except (SystemExit, KeyboardInterrupt):
+        pass
     finally:
-        zero = Float64MultiArray()
-        zero.data = [0.0] * 12
-        node.cmd_pub.publish(zero)
         node.destroy_node()
         rclpy.shutdown()
 
