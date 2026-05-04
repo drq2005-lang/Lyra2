@@ -102,15 +102,14 @@ class CascadedPID:
     """
 
     def __init__(self,
-                 # position PID
-                 kp_pos=1.0,  ki_pos=0.00, kd_pos=0.0,
-                 # velocity PID
-                 kp_vel=0.5,  ki_vel=0.0, kd_vel=0.0,
-                 # torque PID
-                 kp_trq=0.05,  ki_trq=0.0, kd_trq=0.0,
+                 # position PID (Increase this so it chases the shape harder)
+                 kp_pos=3.0,  ki_pos=0.0, kd_pos=0.01,  # Bumped kp to 3.0, added a tiny kd
+                 # velocity PID 
+                 kp_vel=1.0,  ki_vel=0.0, kd_vel=0.0,   # Bumped kp to 1.0
+                 # torque PID (Increase this to give the motors more authority)
+                 kp_trq=0.2, ki_trq=0.0, kd_trq=0.0,    # Bumped kp to 0.2
                  dt=0.005,
-                 max_vel=4.0, max_trq=2.0, max_delta=0.05):
-
+                 max_vel=4.0, max_trq=2.0, max_delta=0.1): # Increased max_delta to 0.1 so it's allowed to move further!
         self.dt = dt
 
         # gains
