@@ -95,12 +95,12 @@ def generate_launch_description():
 #    )
 
     # Delay art node until forward_command_controller is up
-    delay_art_after_fcc = RegisterEventHandler(
-        event_handler=OnProcessExit(
-            target_action=forward_command_controller_spawner,
-            on_exit=[pupper_art_node],
-        )
-    )
+#    delay_art_after_fcc = RegisterEventHandler(
+#        event_handler=OnProcessExit(
+#            target_action=forward_command_controller_spawner,
+#            on_exit=[pupper_art_node],
+#        )
+#    )
 
     nodes = [
         control_node,
