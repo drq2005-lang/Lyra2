@@ -1,0 +1,670 @@
+"""
+pupper_art.py — Pupper V3 floor art drawing node
+=================================================
+Uses Inverse Kinematics + Cascaded PID (position → angular-velocity → torque)
+to move the RIGHT FRONT leg (pen tip) along pre-planned shapes on the floor.
+Left front and both rear legs remain in a fixed standing stance.
+
+Architecture
+------------
+  desired_ee_position
+       │
+       ▼
+  [Position PID]  → desired joint angular velocity
+       │
+       ▼
+  [Angular-velocity PID]  → desired torque increment
+       │
+       ▼
+  [Torque PID / integrator]  → final position command
+       │
+       ▼
+  /forward_command_controller/commands
+
+Shapes supported: circle, star (5-pointed)
+The node draws the circle first, pauses, then draws the star.
+"""
+
+import sys
+import threading
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray
+import numpy as np
+import scipy.optimize
+import matplotlib
+matplotlib.use('Agg')          # headless-safe backend
+import matplotlib.pyplot as plt
+
+np.set_printoptions(precision=4, suppress=True)
+
+# ──────────────────────────────────────────────
+# Homogeneous transform helpers
+# ──────────────────────────────────────────────
+
+def rotation_x(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[1,0,0,0],[0,c,-s,0],[0,s,c,0],[0,0,0,1]], dtype=float)
+
+def rotation_y(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c,0,s,0],[0,1,0,0],[-s,0,c,0],[0,0,0,1]], dtype=float)
+
+def rotation_z(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c,-s,0,0],[s,c,0,0],[0,0,1,0],[0,0,0,1]], dtype=float)
+
+def translation(x, y, z):
+    return np.array([[1,0,0,x],[0,1,0,y],[0,0,1,z],[0,0,0,1]], dtype=float)
+
+
+# ──────────────────────────────────────────────
+# Shape generators
+# ──────────────────────────────────────────────
+
+def generate_circle(center_x, center_y, z_floor, radius=0.04, n_points=120):
+    """Generate (x, y, z) waypoints for a circle in the floor plane."""
+    angles = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
+    pts = []
+    for a in angles:
+        pts.append(np.array([
+            center_x + radius * np.cos(a),
+            center_y + radius * np.sin(a),
+            z_floor
+        ]))
+    pts.append(pts[0])          # close the shape
+    return pts
+
+
+def generate_star(cx, cy, z, r_outer=0.05, r_inner=0.02, n_points=5, n_total=120):
+    """
+    Generate a dense star path by interpolating along each edge between
+    alternating outer (tip) and inner (valley) vertices.
+    n_total: approximate total number of points (distributed evenly across edges).
+    """
+    # Build the sparse corner vertices (outer tip, inner valley, ...)
+    corners = []
+    for i in range(2 * n_points):
+        r = r_outer if (i % 2 == 0) else r_inner
+        a = np.pi / 2 + i * np.pi / n_points
+        corners.append(np.array([cx + r * np.cos(a), cy + r * np.sin(a), z]))
+ 
+    n_edges = len(corners)  # = 2 * n_points = 10
+    pts_per_edge = max(2, n_total // n_edges)
+ 
+    pts = []
+    for i in range(n_edges):
+        start = corners[i]
+        end   = corners[(i + 1) % n_edges]
+        # linspace from start→end, endpoint=False avoids duplicating the corner
+        for t in np.linspace(0, 1, pts_per_edge, endpoint=False):
+            pts.append(start + t * (end - start))
+ 
+    pts.append(pts[0])  # close the path
+    return pts
+
+
+# ──────────────────────────────────────────────
+# Cascaded PID controller (per-joint, 3 joints)
+# ──────────────────────────────────────────────
+
+class CascadedPID:
+    """
+    Three-stage cascaded PID for a single joint:
+      Stage 1: position error       → desired angular velocity
+      Stage 2: angular-velocity error → desired torque increment
+      Stage 3: torque error          → final torque / position command
+
+    In practice the robot accepts POSITION commands, so the output of stage 3
+    is added as a small delta to the current IK-computed joint angle.
+    """
+
+    def __init__(self,
+                 kp_pos=1,  ki_pos=0.001, kd_pos=0.001,
+                 kp_vel=1,  ki_vel=0.001, kd_vel=0.001,
+                 kp_trq=0.0001,  ki_trq=0.00001, kd_trq=0.000001,
+                 dt=0.005, max_vel=2.0, max_trq=1.0, max_delta=0.05):
+        self.dt = dt
+        self.kp_pos, self.ki_pos, self.kd_pos = kp_pos, ki_pos, kd_pos
+        self.kp_vel, self.ki_vel, self.kd_vel = kp_vel, ki_vel, kd_vel
+        self.kp_trq, self.ki_trq, self.kd_trq = kp_trq, ki_trq, kd_trq
+        self.max_vel, self.max_trq, self.max_delta = max_vel, max_trq, max_delta
+        self.reset()
+
+    def reset(self):
+        self._int_pos = 0.0
+        self._int_vel = 0.0
+        self._int_trq = 0.0
+        self._prev_pos_err = 0.0
+        self._prev_vel_err = 0.0
+        self._prev_trq_err = 0.0
+
+    def update(self, desired_angle: float, current_angle: float, current_velocity: float):
+        """
+        Returns a delta that should be ADDED to the IK-computed joint angle.
+        """
+        dt = self.dt
+
+        # ── Stage 1: position PID → desired angular velocity ──────────────
+        pos_err = desired_angle - current_angle
+        self._int_pos += pos_err * dt
+        d_pos_err = (pos_err - self._prev_pos_err) / dt
+        self._prev_pos_err = pos_err
+
+        desired_vel = (self.kp_pos * pos_err
+                       + self.ki_pos * self._int_pos
+                       + self.kd_pos * d_pos_err)
+        desired_vel = np.clip(desired_vel, -self.max_vel, self.max_vel)
+
+        # ── Stage 2: velocity PID → desired torque ─────────────────────────
+        vel_err = desired_vel - current_velocity
+        self._int_vel += vel_err * dt
+        d_vel_err = (vel_err - self._prev_vel_err) / dt
+        self._prev_vel_err = vel_err
+
+        desired_trq = (self.kp_vel * vel_err
+                       + self.ki_vel * self._int_vel
+                       + self.kd_vel * d_vel_err)
+        desired_trq = np.clip(desired_trq, -self.max_trq, self.max_trq)
+
+        # ── Stage 3: torque PID → position delta ──────────────────────────
+        # We treat "torque error" as (desired_trq − 0) since we want to achieve
+        # the desired torque from rest (robot is position-controlled).
+        trq_err = desired_trq
+        self._int_trq += trq_err * dt
+        d_trq_err = (trq_err - self._prev_trq_err) / dt
+        self._prev_trq_err = trq_err
+
+        delta = (self.kp_trq * trq_err
+                 + self.ki_trq * self._int_trq
+                 + self.kd_trq * d_trq_err)
+        delta = np.clip(delta, -self.max_delta, self.max_delta)
+
+        return delta
+
+
+# ──────────────────────────────────────────────
+# Main ROS 2 node
+# ──────────────────────────────────────────────
+
+class PupperArt(Node):
+
+    # ── Standing angles for all four legs ─────────────────────────────────
+
+
+    STAND_ANGLES_LF = np.array([-1.72766, -0.44671, +2.51156])
+    STAND_ANGLES_RB = np.array([+1.66891, +1.72504, -2.31167])
+    STAND_ANGLES_LB = np.array([-1.60368, -1.68193, +2.64584])
+
+    #STAND_ANGLES_LF = np.array([-1.84630, -0.45434, +2.65576])
+    #STAND_ANGLES_RB = np.array([+1.62009, +1.65790, -2.35630])
+    #STAND_ANGLES_LB = np.array([-0.31697, -0.01030, +0.42069])
+
+
+    # RF home:
+    STAND_ANGLES_RF_HOME = np.array([+1.04291, -0.39978, +0.69436])
+
+
+    # Servo stiffness — ramped from 0 → these values during stand_up phase
+    SERVO_KP      = 5.0   # position gain — enough to stand, not so much it snaps
+    SERVO_KD      = 0.2   # damping gain
+    RAMP_UP_SECS  = 3.0   # seconds to ramp from limp to full stiffness
+
+    # RF pen tip height while drawing (metres, in body frame, negative = down)
+    PEN_Z = -0.14
+
+    # RF "pen-up" height for transitions
+    PEN_UP_Z = -0.10
+
+    # RF leg centre position (body frame x-y)
+    RF_CENTER_X =  0.06
+    RF_CENTER_Y = -0.09
+
+    # Drawing parameters
+    CIRCLE_RADIUS   = 0.035   # m
+    STAR_R_OUTER    = 0.040   # m
+    STAR_R_INNER    = 0.016   # m
+    N_CIRCLE_PTS    = 150
+    DRAW_FREQ       = 50.0    # Hz  (waypoint advance rate)
+    CTRL_FREQ       = 200.0   # Hz  (PD / publish rate)
+
+    def __init__(self):
+        super().__init__('pupper_art')
+
+        # ── ROS interfaces ─────────────────────────────────────────────────
+        self.joint_sub = self.create_subscription(
+            JointState, 'joint_states', self._joint_cb, 10)
+        self.cmd_pub = self.create_publisher(
+            Float64MultiArray, '/forward_command_controller/commands', 10)
+        self.kp_pub  = self.create_publisher(
+            Float64MultiArray, '/forward_kp_controller/commands', 10)
+        self.kd_pub  = self.create_publisher(
+            Float64MultiArray, '/forward_kd_controller/commands', 10)
+
+        # ── State ──────────────────────────────────────────────────────────
+        self.joint_positions  = None
+        self.joint_velocities = None
+
+        # 12-element command array: [RF(3), LF(3), RB(3), LB(3)]
+        self.cmd = np.zeros(12)
+
+        # IK-computed target for RF leg — use RF home, not LF angles
+        self.target_rf = np.array(self.STAND_ANGLES_RF_HOME)
+
+        # Cascaded PIDs — one per RF joint
+        dt_pid = 1.0 / self.CTRL_FREQ
+        self.pids = [CascadedPID(dt=dt_pid) for _ in range(3)]
+
+        # ── Drawing sequence ───────────────────────────────────────────────
+        cx, cy = self.RF_CENTER_X, self.RF_CENTER_Y
+        self.shapes = [
+            generate_circle(cx, cy, self.PEN_Z,
+                            radius=self.CIRCLE_RADIUS,
+                            n_points=self.N_CIRCLE_PTS),
+            generate_star(cx, cy, self.PEN_Z,
+                          r_outer=self.STAR_R_OUTER,
+                          r_inner=self.STAR_R_INNER),
+        ]
+        self.shape_names = ['circle', 'star']
+
+        self.current_shape_idx = 0
+        self.current_wp_idx    = 0
+        # stand_up: ramp all 4 legs to standing with increasing kp/kd
+        # stand:    hold for 2 s, confirm stability
+        # pen_down → draw → pen_up → done → standing_hold (until q)
+        self.phase             = 'idle'   # waits for 's' keypress
+        self.phase_counter     = 0
+        self.RAMP_TICKS        = int(self.RAMP_UP_SECS * self.CTRL_FREQ)
+        self.STAND_TICKS       = int(2.0 * self.CTRL_FREQ)
+        self.PEN_DOWN_TICKS    = int(1.0 * self.CTRL_FREQ)
+
+        self.draw_wp_counter   = 0
+
+        # ── Recording buffers for desired vs actual EE positions ───────────
+        # One list per shape; each entry is a 3-vector recorded every control
+        # tick while phase == 'draw'.
+        self._rec_desired = [[] for _ in self.shapes]
+        self._rec_actual  = [[] for _ in self.shapes]
+
+        # ── Timers ─────────────────────────────────────────────────────────
+        self.ctrl_timer = self.create_timer(1.0 / self.CTRL_FREQ, self._ctrl_cb)
+
+        # ── Keypress thread ────────────────────────────────────────────────
+        self._key_thread = threading.Thread(target=self._key_loop, daemon=True)
+        self._key_thread.start()
+
+        self.get_logger().info(
+            'PupperArt ready.\n'
+            '  s = stand up\n'
+            '  d = start drawing  (only after standing)\n'
+            '  q = relax and quit\n'
+        )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Keypress input
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _key_loop(self):
+        print('\nControls:  s = stand   d = draw   q = relax + quit\n', flush=True)
+        while rclpy.ok():
+            key = input().strip().lower()
+            if key == 's':
+                if self.phase == 'idle':
+                    self.phase = 'stand_up'
+                    self.phase_counter = 0
+                    print('[STANDING UP]', flush=True)
+                else:
+                    print('[already standing or drawing — press d to draw]', flush=True)
+            elif key == 'd':
+                if self.phase == 'standing_hold':
+                    self.phase = 'pen_down'
+                    self.phase_counter = 0
+                    print('[DRAWING]', flush=True)
+                elif self.phase == 'idle':
+                    print('[press s to stand first]', flush=True)
+                else:
+                    print(f'[not ready to draw yet — phase: {self.phase}]', flush=True)
+            elif key == 'q':
+                print('[RELAXING AND QUITTING]', flush=True)
+                self.phase = 'relax_quit'
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Forward kinematics (RF leg only)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _rf_fk(theta):
+        T01 = translation(0.07500, -0.08350, 0) @ rotation_x(1.57080) @ rotation_z(theta[0])
+        T12 = rotation_y(-1.57080) @ rotation_z(theta[1])
+        T23 = translation(0, -0.04940, 0.06850) @ rotation_y(1.57080) @ rotation_z(theta[2])
+        T3e = translation(0.06231, -0.06216, 0.01800)
+        return (T01 @ T12 @ T23 @ T3e)[:3, 3]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Inverse kinematics (RF leg, numerical)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _rf_ik(self, target_ee: np.ndarray, initial_guess=None) -> np.ndarray:
+        if initial_guess is None:
+            initial_guess = [0.0, 0.65, -1.30]
+
+        def cost(theta):
+            return self._rf_fk(theta) - target_ee
+
+        result = scipy.optimize.least_squares(
+            cost,
+            x0=initial_guess,
+            method='lm',
+            ftol=1e-7, xtol=1e-7, gtol=1e-7,
+            max_nfev=200
+        )
+        return result.x
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Joint state callback
+    # ──────────────────────────────────────────────────────────────────────
+
+    JOINT_ORDER = [
+        'leg_front_r_1', 'leg_front_r_2', 'leg_front_r_3',
+        'leg_front_l_1', 'leg_front_l_2', 'leg_front_l_3',
+        'leg_back_r_1',  'leg_back_r_2',  'leg_back_r_3',
+        'leg_back_l_1',  'leg_back_l_2',  'leg_back_l_3',
+    ]
+
+    def _joint_cb(self, msg):
+        try:
+            idxs = [msg.name.index(j) for j in self.JOINT_ORDER]
+            self.joint_positions  = np.array([msg.position[i] for i in idxs])
+            self.joint_velocities = np.array([msg.velocity[i] for i in idxs])
+        except ValueError as e:
+            self.get_logger().warn(f'Joint name not found: {e}')
+
+    # ──────────────────────────────────────────────────────────────────────
+    # State-machine helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _current_waypoint(self):
+        shape = self.shapes[self.current_shape_idx]
+        return shape[self.current_wp_idx]
+
+    def _advance_waypoint(self):
+        shape = self.shapes[self.current_shape_idx]
+        self.current_wp_idx += 1
+        if self.current_wp_idx >= len(shape):
+            # Finished this shape
+            self.get_logger().info(
+                f'Finished drawing {self.shape_names[self.current_shape_idx]}!')
+            self.current_shape_idx += 1
+            self.current_wp_idx = 0
+            if self.current_shape_idx >= len(self.shapes):
+                self.phase = 'done'
+            else:
+                self.phase = 'pen_up'
+                self.phase_counter = 0
+                self.get_logger().info(
+                    f'Starting {self.shape_names[self.current_shape_idx]}…')
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Control callback (200 Hz)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _ctrl_cb(self):
+        if self.joint_positions is None:
+            return
+
+        pos = self.joint_positions
+        vel = self.joint_velocities
+
+        rf_pos = pos[0:3]
+        rf_vel = vel[0:3]
+
+        # ── State machine ──────────────────────────────────────────────────
+        CTRL_PER_WP = max(1, int(self.CTRL_FREQ / self.DRAW_FREQ))
+
+        if self.phase == 'idle':
+            return   # waiting for 's'
+
+        elif self.phase == 'stand_up':
+            # Ramp kp/kd linearly from 0 → SERVO_KP/KD over RAMP_TICKS.
+            # All 4 legs are commanded to their standing targets the whole time,
+            # so as stiffness increases they pull themselves to the right pose.
+            alpha  = min(1.0, self.phase_counter / self.RAMP_TICKS)
+            kp_now = alpha * self.SERVO_KP
+            kd_now = alpha * self.SERVO_KD
+            self.kp_pub.publish(Float64MultiArray(data=[kp_now] * 12))
+            self.kd_pub.publish(Float64MultiArray(data=[kd_now] * 12))
+
+            stand_cmd = np.concatenate([
+                self.STAND_ANGLES_RF_HOME,
+                self.STAND_ANGLES_LF,
+                self.STAND_ANGLES_RB,
+                self.STAND_ANGLES_LB,
+            ])
+            self.cmd_pub.publish(Float64MultiArray(data=stand_cmd.tolist()))
+
+            self.phase_counter += 1
+            if self.phase_counter >= self.RAMP_TICKS:
+                self.phase = 'stand'
+                self.phase_counter = 0
+                self.get_logger().info('All legs standing — holding 2 s before drawing…')
+            return   # skip PID / publish below during ramp
+
+        elif self.phase == 'stand':
+            # Hold all four legs at standing targets for STAND_TICKS.
+            # kp/kd are already at full value from stand_up phase.
+            self.target_rf = np.array(self.STAND_ANGLES_RF_HOME)
+            stand_cmd = np.concatenate([
+                self.STAND_ANGLES_RF_HOME,
+                self.STAND_ANGLES_LF,
+                self.STAND_ANGLES_RB,
+                self.STAND_ANGLES_LB,
+            ])
+            self.cmd_pub.publish(Float64MultiArray(data=stand_cmd.tolist()))
+            self.phase_counter += 1
+            if self.phase_counter >= self.STAND_TICKS:
+                self.phase = 'standing_hold'
+                self.phase_counter = 0
+                self.get_logger().info('Standing stable — press d to start drawing.')
+            return   # skip PID / publish below during hold
+
+        elif self.phase == 'standing_hold':
+            # Hold standing pose indefinitely; waiting for 'd' or 'q'
+            stand_cmd = np.concatenate([
+                self.STAND_ANGLES_RF_HOME,
+                self.STAND_ANGLES_LF,
+                self.STAND_ANGLES_RB,
+                self.STAND_ANGLES_LB,
+            ])
+            self.cmd_pub.publish(Float64MultiArray(data=stand_cmd.tolist()))
+            return
+
+        elif self.phase == 'pen_down':
+            # Smoothly lower pen to drawing height
+            alpha = min(1.0, self.phase_counter / self.PEN_DOWN_TICKS)
+            target_z = self.PEN_UP_Z + alpha * (self.PEN_Z - self.PEN_UP_Z)
+            wp = self._current_waypoint()
+            target_rf_ee = np.array([wp[0], wp[1], target_z])
+            self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
+            self.phase_counter += 1
+            if self.phase_counter >= self.PEN_DOWN_TICKS:
+                self.phase = 'draw'
+                self.draw_wp_counter = 0
+                self.get_logger().info(
+                    f'Drawing {self.shape_names[self.current_shape_idx]}…')
+
+        elif self.phase == 'draw':
+            wp = self._current_waypoint()
+            self.target_rf = self._rf_ik(wp, initial_guess=list(rf_pos))
+
+            # ── Record desired vs actual end-effector positions ────────────
+            sidx = self.current_shape_idx
+            self._rec_desired[sidx].append(np.array(wp, dtype=float))
+            self._rec_actual[sidx].append(self._rf_fk(rf_pos))
+
+            self.draw_wp_counter += 1
+            if self.draw_wp_counter >= CTRL_PER_WP:
+                self.draw_wp_counter = 0
+                self._advance_waypoint()
+
+        elif self.phase == 'pen_up':
+            # Lift pen, then go to start of next shape
+            alpha = min(1.0, self.phase_counter / self.PEN_DOWN_TICKS)
+            target_z = self.PEN_Z + alpha * (self.PEN_UP_Z - self.PEN_Z)
+            next_wp = self._current_waypoint()
+            target_rf_ee = np.array([next_wp[0], next_wp[1], target_z])
+            self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
+            self.phase_counter += 1
+            if self.phase_counter >= self.PEN_DOWN_TICKS:
+                self.phase = 'pen_down'
+                self.phase_counter = 0
+
+        elif self.phase == 'done':
+            # Raise pen back to home, hold briefly, then return to standing_hold
+            target_rf_ee = np.array([self.RF_CENTER_X,
+                                     self.RF_CENTER_Y,
+                                     self.PEN_UP_Z])
+            self.target_rf = self._rf_ik(target_rf_ee, initial_guess=list(rf_pos))
+            self.phase_counter += 1
+            if self.phase_counter >= int(1.0 * self.CTRL_FREQ):
+                self.get_logger().info('Drawing complete — generating plots…')
+                self._plot_results()
+                self.get_logger().info('Plots saved. Standing by. Press q to quit.')
+                self.phase = 'standing_hold'
+                self.phase_counter = 0
+
+        elif self.phase == 'relax_quit':
+            zero = Float64MultiArray(data=[0.0] * 12)
+            self.cmd_pub.publish(zero)
+            self.kp_pub.publish(zero)
+            self.kd_pub.publish(zero)
+            sys.exit(0)
+
+        # ── Cascaded PID correction on RF joints ──────────────────────────
+        rf_cmd = np.zeros(3)
+        for j in range(3):
+            delta = self.pids[j].update(
+                desired_angle=self.target_rf[j],
+                current_angle=rf_pos[j],
+                current_velocity=rf_vel[j]
+            )
+            rf_cmd[j] = self.target_rf[j] + delta
+
+        # ── Stationary legs: pure IK hold (no cascaded PID needed) ────────
+        lf_cmd = self.STAND_ANGLES_LF
+        rb_cmd = self.STAND_ANGLES_RB
+        lb_cmd = self.STAND_ANGLES_LB
+
+        # ── Pack and publish [RF, LF, RB, LB] ─────────────────────────────
+        self.cmd = np.concatenate([rf_cmd, lf_cmd, rb_cmd, lb_cmd])
+        msg = Float64MultiArray()
+        msg.data = self.cmd.tolist()
+        self.cmd_pub.publish(msg)
+
+        # ── Logging (throttled) ───────────────────────────────────────────
+        if self.phase == 'draw':
+            shape_name  = self.shape_names[self.current_shape_idx]
+            n_wps       = len(self.shapes[self.current_shape_idx])
+            self.get_logger().info(
+                f'[{shape_name}] wp {self.current_wp_idx}/{n_wps} | '
+                f'RF target: {self.target_rf} | '
+                f'RF actual: {rf_pos} | '
+                f'EE target: {self._rf_fk(self.target_rf)} | '
+                f'EE actual: {self._rf_fk(rf_pos)}',
+                throttle_duration_sec=0.5
+            )
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Plotting & RMSE
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _plot_results(self):
+        """
+        For each recorded shape generate a two-panel figure:
+          Left  — XY trajectory (desired = solid blue, actual = dashed red)
+          Right — Z position over time steps
+        RMSE (XYZ) is computed and printed, and annotated on the Z panel.
+        Figures are saved as <shape_name>_trajectory.png.
+        """
+        for idx, name in enumerate(self.shape_names):
+            desired = self._rec_desired[idx]
+            actual  = self._rec_actual[idx]
+
+            if not desired:
+                self.get_logger().warn(f'No data recorded for shape "{name}" — skipping plot.')
+                continue
+
+            des = np.array(desired)   # (N, 3)
+            act = np.array(actual)    # (N, 3)
+            steps = np.arange(len(des))
+
+            # ── RMSE ───────────────────────────────────────────────────────
+            rmse = np.sqrt(np.mean(np.sum((des - act) ** 2, axis=1)))
+            rmse_xy = np.sqrt(np.mean(np.sum((des[:, :2] - act[:, :2]) ** 2, axis=1)))
+            rmse_z  = np.sqrt(np.mean((des[:, 2] - act[:, 2]) ** 2))
+            self.get_logger().info(
+                f'[{name.upper()}] RMSE — XYZ: {rmse*1000:.3f} mm | '
+                f'XY: {rmse_xy*1000:.3f} mm | Z: {rmse_z*1000:.3f} mm'
+            )
+            print(
+                f'\n=== {name.upper()} RMSE ===\n'
+                f'  XYZ : {rmse*1000:.4f} mm\n'
+                f'  XY  : {rmse_xy*1000:.4f} mm\n'
+                f'  Z   : {rmse_z*1000:.4f} mm\n'
+            )
+
+            # ── Figure layout (matches reference) ─────────────────────────
+            fig, (ax_xy, ax_z) = plt.subplots(1, 2, figsize=(10, 4))
+            cap = name.capitalize()
+
+            # Left — XY trajectory
+            ax_xy.plot(des[:, 0], des[:, 1], 'b-',  linewidth=1.5, label='Desired')
+            ax_xy.plot(act[:, 0], act[:, 1], 'r--', linewidth=1.0, label='Actual')
+            ax_xy.set_title(f'{cap} Trajectory')
+            ax_xy.set_xlabel('X')
+            ax_xy.set_ylabel('Y')
+            ax_xy.legend()
+            ax_xy.set_aspect('equal', 'box')
+
+            # Right — Z over time
+            ax_z.plot(steps, des[:, 2], 'b-',  linewidth=1.5, label='Desired Z')
+            ax_z.plot(steps, act[:, 2], 'r--', linewidth=1.0, label='Actual Z')
+            ax_z.set_title(f'{cap} Z Position')
+            ax_z.set_xlabel('Time step')
+            ax_z.set_ylabel('Z')
+            ax_z.legend()
+            ax_z.annotate(
+                f'RMSE XYZ={rmse*1000:.3f} mm\n'
+                f'RMSE XY ={rmse_xy*1000:.3f} mm\n'
+                f'RMSE Z  ={rmse_z*1000:.3f} mm',
+                xy=(0.02, 0.03), xycoords='axes fraction',
+                fontsize=7.5, color='darkred',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.8)
+            )
+
+            fig.tight_layout()
+            fname = f'{name}_trajectory.png'
+            fig.savefig(fname, dpi=150)
+            plt.close(fig)
+            self.get_logger().info(f'Saved plot → {fname}')
+
+
+# ──────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────
+
+def main():
+    rclpy.init()
+    node = PupperArt()
+    try:
+        rclpy.spin(node)
+    except (SystemExit, KeyboardInterrupt):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
