@@ -103,13 +103,13 @@ class CascadedPID:
 
     def __init__(self,
                  # position PID
-                 kp_pos=8.0,  ki_pos=0.05, kd_pos=0.4,
+                 kp_pos=1.0,  ki_pos=0.00, kd_pos=0.0,
                  # velocity PID
-                 kp_vel=2.0,  ki_vel=0.02, kd_vel=0.1,
+                 kp_vel=0.5,  ki_vel=0.0, kd_vel=0.0,
                  # torque PID
-                 kp_trq=0.5,  ki_trq=0.005, kd_trq=0.02,
+                 kp_trq=0.05,  ki_trq=0.0, kd_trq=0.0,
                  dt=0.005,
-                 max_vel=4.0, max_trq=2.0, max_delta=0.15):
+                 max_vel=4.0, max_trq=2.0, max_delta=0.05):
 
         self.dt = dt
 
@@ -186,8 +186,8 @@ class PupperArt(Node):
     # ── Standing angles for stationary legs (LF, RB, LB) ─────────────────
     # These keep the body level while the RF leg draws.
     # Obtained by running IK for each leg at its nominal stand position.
-    STAND_ANGLES_LF = np.array([ 0.00,  0.65, -1.30])
-    STAND_ANGLES_RB = np.array([ 0.00,  0.65, -1.30])
+    STAND_ANGLES_LF = np.array([ 0.00,  -0.65, 1.30])
+    STAND_ANGLES_RB = np.array([ 0.00,  -0.65, 1.30])
     STAND_ANGLES_LB = np.array([ 0.00,  0.65, -1.30])
 
     # RF pen tip height while drawing (metres, in body frame, negative = down)
